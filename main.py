@@ -4,7 +4,15 @@ from urllib.parse import urlparse, parse_qs, unquote
 import pymysql
 import argparse
 import sys
+import re
 import os
+
+
+# A session_id is a UUID, e.g. 71a985cd-6d3d-4a3c-9a0e-5ac287a127b7
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def parse_url(url):
@@ -44,19 +52,23 @@ def parse_url(url):
     }
 
 
+def session_query(session_id):
+    """Build the sessions lookup query for a given session_id."""
+    return (
+        "SELECT * FROM kane_vms.sessions "
+        f"WHERE id = '{session_id}'"
+    )
+
+
 def build_session_query(url):
     """Build the sessions lookup query from a kaneai URL."""
     info = parse_url(url)
-    session_id = info["session_id"]
 
     # NOTE: fqdn distinguishes scenario 1 (device.lambdatest.com) from
     # scenario 2 (kaneaivm-*.lambdatest.com/<ip>). For now both look the
     # session up the same way; branch here when scenario 2 needs different
     # behaviour.
-    return (
-        "SELECT * FROM kane_vms.sessions "
-        f"WHERE id = '{session_id}'"
-    )
+    return session_query(info["session_id"])
 
 
 def run_query(query):
@@ -109,16 +121,20 @@ def main():
         nargs="?",
         default="SELECT * FROM tms.test_cases limit 1",
         help=(
-            "SQL query to execute, or a kaneai app/web-agent URL. When a URL "
-            "is given, its session_id is extracted and the sessions lookup "
-            "query is run. Defaults to a sample query."
+            "A kaneai app/web-agent URL, a bare session_id (UUID), or a raw "
+            "SQL query. For a URL or session_id the sessions lookup query is "
+            "run; a UUID needs no quotes, so it avoids the shell splitting a "
+            "URL on '&'. Defaults to a sample query."
         ),
     )
     args = parser.parse_args()
 
-    arg = args.query
+    arg = args.query.strip()
     if arg.startswith("http://") or arg.startswith("https://"):
         query = build_session_query(arg)
+    elif UUID_RE.match(arg):
+        # Bare session_id — no shell-special characters, so no quoting needed.
+        query = session_query(arg)
     else:
         query = arg
 
