@@ -2,6 +2,7 @@ from sshtunnel import SSHTunnelForwarder
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs, unquote
 import pymysql
+import paramiko
 import argparse
 import sys
 import re
@@ -71,6 +72,78 @@ def build_session_query(url):
     return session_query(info["session_id"])
 
 
+def device_udid(row):
+    """Extract the device UDID from a sessions row.
+
+    The UDID lives in the ``remark`` column. This is the single integration
+    point for the UDID-extraction logic — adjust the parsing here if ``remark``
+    holds more than the bare UDID.
+    """
+    remark = row.get("remark")
+    if remark is None:
+        return None
+    return str(remark).strip()
+
+
+def build_tail_command(os_name, udid):
+    """Build the remote command that tails the live device log.
+
+    The log directory depends on the device OS:
+      - iOS:     Documents/kaneai/app-agent_<udid>
+      - Android: Documents/kaneai/logs
+    """
+    if (os_name or "").strip().lower() == "ios":
+        log_dir = f"Documents/kaneai/app-agent_{udid}"
+    else:  # android (default)
+        log_dir = "Documents/kaneai/logs"
+    return f"cd {log_dir} && tail -f app_{udid}.log"
+
+
+def tail_device_logs(host_ip, os_name, udid):
+    """SSH into the device host and stream its live log to stdout.
+
+    Connects directly to ``host_ip`` as HOST_SSH_USER (default "ltadmin") using
+    the password from HOST_SSH_PASS, then runs the tail command and prints its
+    output live until interrupted with Ctrl-C.
+    """
+    ssh_user = os.environ.get("HOST_SSH_USER", "ltadmin")
+    ssh_pass = os.environ.get("HOST_SSH_PASS")
+    if not ssh_pass:
+        print(
+            "HOST_SSH_PASS is not set — add it to your .env to stream logs "
+            "(e.g. HOST_SSH_PASS=... , HOST_SSH_USER defaults to 'ltadmin').",
+            file=sys.stderr,
+        )
+        return
+
+    command = build_tail_command(os_name, udid)
+    print(f"\nConnecting to {ssh_user}@{host_ip} ...")
+    print(f"$ {command}\n(press Ctrl-C to stop)\n")
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        # NOTE: direct connection. If host_ip is ever only reachable via the
+        # bastion, open a ProxyJump channel and pass it here as `sock=`.
+        client.connect(
+            hostname=host_ip,
+            port=22,
+            username=ssh_user,
+            password=ssh_pass,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+
+        stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+        try:
+            for line in iter(stdout.readline, ""):
+                print(line, end="")
+        except KeyboardInterrupt:
+            print("\nStopped tailing logs.")
+    finally:
+        client.close()
+
+
 def run_query(query):
     load_dotenv()   # <-- this was missing; reads .env into os.environ
 
@@ -107,6 +180,7 @@ def run_query(query):
                 rows = cursor.fetchall()
                 for row in rows:
                     print(row)
+                return rows
         finally:
             conn.close()
 
@@ -127,18 +201,42 @@ def main():
             "URL on '&'. Defaults to a sample query."
         ),
     )
+    parser.add_argument(
+        "--no-tail",
+        action="store_true",
+        help=(
+            "Only print the sessions row; do not SSH into the host and tail "
+            "its live log. Ignored for raw SQL queries."
+        ),
+    )
     args = parser.parse_args()
 
     arg = args.query.strip()
+    is_lookup = False
     if arg.startswith("http://") or arg.startswith("https://"):
         query = build_session_query(arg)
+        is_lookup = True
     elif UUID_RE.match(arg):
         # Bare session_id — no shell-special characters, so no quoting needed.
         query = session_query(arg)
+        is_lookup = True
     else:
         query = arg
 
-    run_query(query)
+    rows = run_query(query)
+
+    # After a session lookup, SSH into the device host and tail its live log.
+    if is_lookup and not args.no_tail and rows:
+        row = rows[0]
+        host_ip = row.get("host_ip")
+        udid = device_udid(row)
+        if not host_ip or not udid:
+            print(
+                "Cannot tail logs: session row is missing host_ip or udid.",
+                file=sys.stderr,
+            )
+            return
+        tail_device_logs(host_ip, row.get("os"), udid)
 
 
 if __name__ == "__main__":
