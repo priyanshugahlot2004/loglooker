@@ -54,7 +54,7 @@ def build_session_query(url):
     )
 
 
-def run_query(query):
+def run_query_get_udid(query):
     load_dotenv()   # <-- this was missing; reads .env into os.environ
 
     # --- SSH tunnel (the "over SSH" part) ---
@@ -88,11 +88,51 @@ def run_query(query):
             with conn.cursor() as cursor:
                 cursor.execute(query)
                 rows = cursor.fetchall()
-                for row in rows:
-                    print(row)
+                remark = rows[0]["remark"]
+                udid = remark.split(" ")[-1]
+                return udid
+                
         finally:
             conn.close()
 
+def run_query_get_hostIP(udid):
+    load_dotenv()   # <-- this was missing; reads .env into os.environ
+
+    # --- SSH tunnel (the "over SSH" part) ---
+    ssh_host = "bastion-rds-prod.lambdatest.com"
+    ssh_user = os.environ["SSH_USER"]       # brackets = clear error if absent
+    ssh_password = os.environ["SSH_PASS"]
+
+    # --- MySQL (relative to the SSH server) ---
+    mysql_host = "rd-ml-db-us.prod.internal"
+    mysql_port = 3306
+    db_user = os.environ["DB_USER_prod"]
+    db_pass = os.environ["DB_PASS_prod"]
+
+    with SSHTunnelForwarder(
+        (ssh_host, 22),
+        ssh_username=ssh_user,
+        ssh_password=ssh_password,
+        remote_bind_address=(mysql_host, mysql_port),
+    ) as tunnel:
+
+        conn = pymysql.connect(
+            host="127.0.0.1",                 # local end of the tunnel
+            port=tunnel.local_bind_port,      # sshtunnel picks a free local port
+            user=db_user,
+            password=db_pass,
+            database="tms",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM lambda_lmds.device_host WHERE udid = '{udid}';")
+                rows = cursor.fetchall()
+                return rows[0]["host_ip"]
+                
+        finally:
+            conn.close()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -117,7 +157,7 @@ def main():
     else:
         query = arg
 
-    run_query(query)
+    print(run_query_get_hostIP(run_query_get_udid(query)))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+main.py
+pyproject.toml
+loglooker.egg-info/PKG-INFO
+loglooker.egg-info/SOURCES.txt
+loglooker.egg-info/dependency_links.txt
+loglooker.egg-info/entry_points.txt
+loglooker.egg-info/requires.txt
+loglooker.egg-info/top_level.txt
