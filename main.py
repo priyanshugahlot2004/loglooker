@@ -1,9 +1,57 @@
 from sshtunnel import SSHTunnelForwarder
 from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qs, unquote
 import pymysql
 import argparse
 import sys
 import os
+
+
+def parse_url(url):
+    """Extract useful fields from a kaneai app/web-agent URL.
+
+    Returns a dict with at least ``session_id``. ``fqdn`` is also returned so
+    callers can branch on the deployment the URL points at:
+
+    - Scenario 1: ``fqdn=device.lambdatest.com``
+    - Scenario 2: ``fqdn=kaneaivm-india.lambdatest.com%2F10-0-240-153``
+      (URL-encoded; the ``%2F`` decodes to ``/``)
+
+    Both scenarios currently resolve the same way (look up the session by id),
+    but ``fqdn`` is surfaced here so scenario-2-specific handling can be added
+    later without changing the call sites.
+    """
+    query = parse_qs(urlparse(url).query)
+
+    session_id = query.get("session_id", [None])[0]
+    if not session_id:
+        raise ValueError(f"No session_id found in URL: {url}")
+
+    fqdn = query.get("fqdn", [None])[0]
+    if fqdn is not None:
+        fqdn = unquote(fqdn)
+
+    return {
+        "session_id": session_id,
+        "fqdn": fqdn,
+        "test_id": query.get("test_id", [None])[0],
+        "region": query.get("region", [None])[0],
+    }
+
+
+def build_session_query(url):
+    """Build the sessions lookup query from a kaneai URL."""
+    info = parse_url(url)
+    session_id = info["session_id"]
+
+    # NOTE: fqdn distinguishes scenario 1 (device.lambdatest.com) from
+    # scenario 2 (kaneaivm-*.lambdatest.com/<ip>). For now both look the
+    # session up the same way; branch here when scenario 2 needs different
+    # behaviour.
+    return (
+        "SELECT * FROM kane_vms.sessions "
+        f"WHERE id = '{session_id}'"
+    )
 
 
 def run_query(query):
@@ -55,10 +103,21 @@ def main():
         "query",
         nargs="?",
         default="SELECT * FROM tms.test_cases limit 1",
-        help="SQL query to execute (defaults to a sample query).",
+        help=(
+            "SQL query to execute, or a kaneai app/web-agent URL. When a URL "
+            "is given, its session_id is extracted and the sessions lookup "
+            "query is run. Defaults to a sample query."
+        ),
     )
     args = parser.parse_args()
-    run_query(args.query)
+
+    arg = args.query
+    if arg.startswith("http://") or arg.startswith("https://"):
+        query = build_session_query(arg)
+    else:
+        query = arg
+
+    run_query(query)
 
 
 if __name__ == "__main__":
