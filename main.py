@@ -25,7 +25,12 @@ def parse_url(url):
 
     session_id = query.get("session_id", [None])[0]
     if not session_id:
-        raise ValueError(f"No session_id found in URL: {url}")
+        raise ValueError(
+            f"No session_id found in URL: {url}\n"
+            "If the URL was cut off at the first '&', wrap it in double "
+            'quotes so the shell keeps it as one argument, e.g.:\n'
+            '    getlogs "https://.../app-agent?...&session_id=..."'
+        )
 
     fqdn = query.get("fqdn", [None])[0]
     if fqdn is not None:
