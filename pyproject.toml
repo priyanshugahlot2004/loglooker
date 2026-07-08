@@ -1,0 +1,20 @@
+[project]
+name = "loglooker"
+version = "0.1.0"
+description = "Run SQL queries against the tms database over an SSH tunnel."
+requires-python = ">=3.8"
+dependencies = [
+    "sshtunnel",
+    "pymysql",
+    "python-dotenv",
+]
+
+[project.scripts]
+getlogs = "main:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
