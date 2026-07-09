@@ -39,6 +39,18 @@ def parse_url(url):
         "region": query.get("region", [None])[0],
     }
 
+def get_vm_ip(url):
+    """Extract the target VM IP from a web-agent URL's fqdn.
+
+    fqdn=kaneaivm-india.lambdatest.com/10-0-240-170  ->  10.0.240.170
+    """
+    info = parse_url(url)
+    fqdn = info["fqdn"]
+    if not fqdn or "/" not in fqdn:
+        raise ValueError(f"No IP found in fqdn: {fqdn!r}")
+
+    ip_part = fqdn.split("/")[-1]      # "10-0-240-170"
+    return ip_part.replace("-", ".")   # "10.0.240.170"
 
 def build_session_query(url):
     """Build the sessions lookup query from a kaneai URL."""
@@ -133,12 +145,55 @@ def run_query_get_hostIP(udid):
                 rows = cursor.fetchall()
                 host_ip = rows[0]["host_ip"]
                 print(f"Host IP for UDID {udid}: {host_ip}")
-                return host_ip
+                _os = rows[0]["os"]
+                print(f"OS for UDID {udid}: {_os}")
+                return host_ip, _os
                 
         finally:
             conn.close()
 
-def run_cli_commands(host_ip, udid):
+def run_cli_commands_for_web(vm_ip):
+    # hop 1: ingress VM
+    ingress = paramiko.SSHClient()
+    ingress.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ingress.connect(
+        "20.198.17.8",
+        username="kaneaiingressvm",
+        password=os.environ["INGRESS_PASS"], 
+    )
+
+    # tunnel from ingress → target VM's SSH port
+    channel = ingress.get_transport().open_channel(
+        "direct-tcpip",
+        (vm_ip, 22),        # target
+        ("127.0.0.1", 0),   # source
+    )
+
+    # hop 2: target VM as azureuser (bifurcation = true)
+    target = paramiko.SSHClient()
+    target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    target.connect(
+        vm_ip,
+        username="azureuser",
+        password=os.environ["AZURE_PASS"],
+        sock=channel,
+    )
+
+    # cd + tail -f, streamed line by line
+    cmd = "cd /usr/src/app/scripts/logger && tail -n 1000 -f app.log"
+    print(f"\n$ {cmd}\n(streaming — press Ctrl+C to stop)\n")
+    stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
+
+    try:
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        target.close()
+        ingress.close()
+
+def run_cli_commands_for_device(host_ip, udid, _os):
     # 1. connect to the bastion
     bastion = paramiko.SSHClient()
     bastion.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -162,12 +217,20 @@ def run_cli_commands(host_ip, udid):
     target.connect(
         host_ip,
         username="ltadmin",
-        password="lambdatest123!",   # password for ltadmin
+        password=os.environ["LTADMIN_PASS"],
         sock=channel,
     )
 
     # 4. cd + tail -f on the target, streamed line by line
-    cmd = f"cd Documents/kaneai/logs && tail -f app_{udid}.log"
+    cmd = ""
+    if(_os == "android"):
+        cmd = f"cd Documents/kaneai/logs && tail -f app_{udid}.log"
+    elif(_os == "ios"):
+        cmd = f"cd Documents/kaneai/app_agent_{udid} && tail -f app.log"
+    else:
+        print(f"Unknown OS: {_os}")
+        return
+    
     print(f"\n$ {cmd}\n(streaming — press Ctrl+C to stop)\n")
     stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
 
@@ -188,7 +251,7 @@ def main():
     parser.add_argument(
         "query",
         nargs="?",
-        default="SELECT * FROM tms.test_cases limit 1",
+        default="",
         help=(
             "SQL query to execute, or a kaneai app/web-agent URL. When a URL "
             "is given, its session_id is extracted and the sessions lookup "
@@ -196,17 +259,23 @@ def main():
         ),
     )
     args = parser.parse_args()
-
     arg = args.query
-    if arg.startswith("http://") or arg.startswith("https://"):
-        query = build_session_query(arg)
+    if("kaneaivm" in arg):
+        #do web
+        run_cli_commands_for_web(get_vm_ip(arg))
+
+    elif("device" in arg):
+        if arg.startswith("http://") or arg.startswith("https://"):
+            query = build_session_query(arg)
+        else:
+            query = arg
+
+        udid = run_query_get_udid(query)
+        host_ip, _os = run_query_get_hostIP(udid)
+        run_cli_commands_for_device(host_ip, udid, _os)
     else:
-        query = arg
-
-    udid = run_query_get_udid(query)
-    host_ip = run_query_get_hostIP(udid)
-    run_cli_commands(host_ip, udid)
-
+        print("Invalid argument. Please provide a valid SQL query or a kaneai URL.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
