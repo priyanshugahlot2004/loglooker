@@ -5,6 +5,7 @@ import pymysql
 import argparse
 import sys
 import os
+import paramiko
 
 
 def parse_url(url):
@@ -90,6 +91,7 @@ def run_query_get_udid(query):
                 rows = cursor.fetchall()
                 remark = rows[0]["remark"]
                 udid = remark.split(" ")[-1]
+                print(f"UDID for query '{query}': {udid}")
                 return udid
                 
         finally:
@@ -129,10 +131,54 @@ def run_query_get_hostIP(udid):
             with conn.cursor() as cursor:
                 cursor.execute(f"SELECT * FROM lambda_lmds.device_host WHERE udid = '{udid}';")
                 rows = cursor.fetchall()
-                return rows[0]["host_ip"]
+                host_ip = rows[0]["host_ip"]
+                print(f"Host IP for UDID {udid}: {host_ip}")
+                return host_ip
                 
         finally:
             conn.close()
+
+def run_cli_commands(host_ip, udid):
+    # 1. connect to the bastion
+    bastion = paramiko.SSHClient()
+    bastion.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    bastion.connect(
+        "bastion-stage.lambdatest.com",
+        username=os.environ["SSH_USER"],
+        password=os.environ["SSH_PASS"],
+    )
+
+    # 2. open a tunnel from the bastion to the target host's SSH port
+    channel = bastion.get_transport().open_channel(
+        "direct-tcpip",
+        (host_ip, 22),      # target
+        ("127.0.0.1", 0),   # source
+    )
+
+    # 3. connect to the target as ltadmin through that tunnel
+    #    AutoAddPolicy = auto-accept the fingerprint ("yes")
+    target = paramiko.SSHClient()
+    target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    target.connect(
+        host_ip,
+        username="ltadmin",
+        password="lambdatest123!",   # password for ltadmin
+        sock=channel,
+    )
+
+    # 4. cd + tail -f on the target, streamed line by line
+    cmd = f"cd Documents/kaneai/logs && tail -f app_{udid}.log"
+    print(f"\n$ {cmd}\n(streaming — press Ctrl+C to stop)\n")
+    stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
+
+    try:
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        target.close()
+        bastion.close()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -157,7 +203,9 @@ def main():
     else:
         query = arg
 
-    print(run_query_get_hostIP(run_query_get_udid(query)))
+    udid = run_query_get_udid(query)
+    host_ip = run_query_get_hostIP(udid)
+    run_cli_commands(host_ip, udid)
 
 
 if __name__ == "__main__":
