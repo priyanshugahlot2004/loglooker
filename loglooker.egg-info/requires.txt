@@ -1,3 +1,4 @@
 sshtunnel
 pymysql
+paramiko
 python-dotenv

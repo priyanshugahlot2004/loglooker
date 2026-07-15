@@ -156,28 +156,52 @@ def run_cli_commands_for_web(vm_ip):
     # hop 1: ingress VM
     ingress = paramiko.SSHClient()
     ingress.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ingress.connect(
-        "20.198.17.8",
-        username="kaneaiingressvm",
-        password=os.environ["INGRESS_PASS"], 
-    )
+    try:
+        ingress.connect(
+            "20.198.17.8",
+            username="kaneaiingressvm",
+            password=os.environ["INGRESS_PASS"],
+        )
+    except paramiko.AuthenticationException:
+        print("✗ Ingress VM (20.198.17.8) rejected the login — check INGRESS_PASS in .env.")
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as e:
+        print(f"✗ Cannot reach the ingress VM (20.198.17.8): {e}")
+        sys.exit(1)
 
     # tunnel from ingress → target VM's SSH port
-    channel = ingress.get_transport().open_channel(
-        "direct-tcpip",
-        (vm_ip, 22),        # target
-        ("127.0.0.1", 0),   # source
-    )
+    try:
+        channel = ingress.get_transport().open_channel(
+            "direct-tcpip",
+            (vm_ip, 22),        # target
+            ("127.0.0.1", 0),   # source
+        )
+    except paramiko.ChannelException:
+        print(
+            f"✗ Cannot reach {vm_ip}:22 through the ingress VM.\n"
+            f"  The target VM may be down, recycled, or in a different network."
+        )
+        ingress.close()
+        sys.exit(1)
 
     # hop 2: target VM as azureuser (bifurcation = true)
     target = paramiko.SSHClient()
     target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    target.connect(
-        vm_ip,
-        username="azureuser",
-        password=os.environ["AZURE_PASS"],
-        sock=channel,
-    )
+    try:
+        target.connect(
+            vm_ip,
+            username="azureuser",
+            password=os.environ["AZURE_PASS"],
+            sock=channel,
+        )
+    except paramiko.AuthenticationException:
+        print(f"✗ Target VM ({vm_ip}) rejected the azureuser login — check AZURE_PASS in .env.")
+        ingress.close()
+        sys.exit(1)
+    except (paramiko.SSHException, OSError) as e:
+        print(f"✗ Failed to establish SSH to target VM ({vm_ip}): {e}")
+        ingress.close()
+        sys.exit(1)
 
     # cd + tail -f, streamed line by line
     cmd = "cd /usr/src/app/scripts/logger && tail -n 1000 -f app.log"
@@ -244,6 +268,7 @@ def run_cli_commands_for_device(host_ip, udid, _os):
         bastion.close()
 
 def main():
+    load_dotenv()   # load .env into os.environ for every code path
     parser = argparse.ArgumentParser(
         prog="getlogs",
         description="Run a SQL query against the tms database over an SSH tunnel.",

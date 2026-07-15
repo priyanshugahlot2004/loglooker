@@ -5,4 +5,5 @@ Summary: Run SQL queries against the tms database over an SSH tunnel.
 Requires-Python: >=3.8
 Requires-Dist: sshtunnel
 Requires-Dist: pymysql
+Requires-Dist: paramiko
 Requires-Dist: python-dotenv
