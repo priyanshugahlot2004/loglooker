@@ -85,6 +85,35 @@ environment.
 Before running, make sure a `.env` file with your credentials exists in the
 project root (see [Configuration](#configuration)).
 
+### Make `getlogs` available everywhere (zsh)
+
+By default `getlogs` only works while the venv is activated. To call it from any
+directory without activating anything, add a zsh alias that points straight at
+the venv's copy of the command.
+
+Run this **once**, from the repo root (so `$PWD` resolves to your loglooker
+folder):
+
+```bash
+echo "alias getlogs=\"$PWD/.venv/bin/getlogs\"" >> ~/.zshrc
+source ~/.zshrc
+```
+
+Now `getlogs "..."` works in any new terminal — no `source .venv/bin/activate`
+needed. (If you move the loglooker folder, update the path in `~/.zshrc`.)
+
+**Alternative — `pipx`:** if you prefer a proper isolated global install instead
+of an alias, use [pipx](https://pipx.pypa.io):
+
+```bash
+brew install pipx
+pipx ensurepath        # adds pipx's bin dir to your PATH (restart the terminal)
+pipx install -e .      # run from the repo root
+```
+
+This puts `getlogs` on your `PATH` globally in its own isolated environment, so
+you don't need the `.venv` or the alias at all.
+
 ### Other platforms
 
 ```bash
