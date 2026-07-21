@@ -37,6 +37,56 @@ continuously. Press `Ctrl+C` to stop.
 
 Requires Python 3.8+.
 
+### macOS
+
+macOS does not ship a bare `pip`, and installing globally can fail with an
+`externally-managed-environment` error, so the recommended setup is a virtual
+environment.
+
+1. **Check Python 3 is installed** (macOS uses `python3`, not `python`):
+
+   ```bash
+   python3 --version
+   ```
+
+   If it's missing, install it with [Homebrew](https://brew.sh):
+
+   ```bash
+   brew install python
+   ```
+
+2. **Create and activate a virtual environment** from the repo root:
+
+   ```bash
+   cd loglooker
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+   Your prompt should now be prefixed with `(.venv)`.
+
+3. **Install the tool** (inside the venv `pip` now exists and works):
+
+   ```bash
+   pip install -e .
+   ```
+
+4. **Run it** — while the venv is active, `getlogs` is on your `PATH`:
+
+   ```bash
+   getlogs "https://.../?fqdn=kaneaivm-india.lambdatest.com%2F10-0-240-170&session_id=..."
+   ```
+
+> **Note:** Each new terminal session needs the venv activated again with
+> `source .venv/bin/activate` before `getlogs` will be found. If you'd rather not
+> use a venv, you can substitute `python3 -m pip install -e .` and run the tool
+> directly with `python3 main.py "..."`.
+
+Before running, make sure a `.env` file with your credentials exists in the
+project root (see [Configuration](#configuration)).
+
+### Other platforms
+
 ```bash
 pip install .
 ```
