@@ -3,9 +3,22 @@ from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs, unquote
 import pymysql
 import argparse
+import socket
 import sys
+import time
 import os
 import paramiko
+
+
+# --- SSH timeouts -----------------------------------------------------------
+# Without these paramiko blocks indefinitely: Transport.open_channel() defaults
+# to timeout=None and spins on event.wait(0.1) for as long as the transport is
+# alive, so an unreachable target VM hangs the CLI with no output at all.
+CONNECT_TIMEOUT = 15   # TCP connect
+BANNER_TIMEOUT = 20    # wait for the SSH banner
+AUTH_TIMEOUT = 20      # wait for auth to complete
+CHANNEL_TIMEOUT = 20   # wait for the jump host to open direct-tcpip
+KEEPALIVE = 30         # detect a silently dead tunnel while streaming
 
 
 def parse_url(url):
@@ -152,7 +165,61 @@ def run_query_get_hostIP(udid):
         finally:
             conn.close()
 
-def run_cli_commands_for_web(vm_ip):
+def ssh_timeouts(timeout):
+    """Timeout kwargs for ``SSHClient.connect``, scaled off the --timeout value.
+
+    ``max`` so that raising --timeout on a slow network never leaves a lower
+    sub-timeout in place to trip first.
+    """
+    return {
+        "timeout": timeout,
+        "banner_timeout": max(timeout, BANNER_TIMEOUT),
+        "auth_timeout": max(timeout, AUTH_TIMEOUT),
+    }
+
+def open_tunnel_channel(client, hop_name, target_ip, timeout=CHANNEL_TIMEOUT):
+    """Open a direct-tcpip channel from a connected jump host to ``target_ip:22``.
+
+    Bounded by ``timeout``: paramiko's default is to wait forever, and a
+    ``ChannelException`` is only raised when the jump host *actively* refuses the
+    channel. When the target is simply unroutable the jump host's own outbound
+    connect stalls and it never replies at all — that is the case this timeout
+    covers. On any failure this prints a diagnosis, closes ``client`` and exits.
+    """
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        print(f"✗ The SSH session to the {hop_name} is no longer active.")
+        client.close()
+        sys.exit(1)
+
+    # surface a silently dead tunnel while streaming instead of idling forever
+    transport.set_keepalive(KEEPALIVE)
+
+    started = time.monotonic()
+    try:
+        return transport.open_channel(
+            "direct-tcpip",
+            (target_ip, 22),    # target
+            ("127.0.0.1", 0),   # source
+            timeout=timeout,
+        )
+    except paramiko.ChannelException:
+        print(
+            f"✗ Cannot reach {target_ip}:22 through the {hop_name}.\n"
+            f"  The target VM may be down, recycled, or in a different network."
+        )
+    except (paramiko.SSHException, socket.timeout, OSError) as e:
+        print(
+            f"✗ Cannot open a tunnel to {target_ip}:22 through the {hop_name} "
+            f"(failed after {time.monotonic() - started:.0f}s): {e}\n"
+            f"  The target VM may be down, recycled, or in a different network.\n"
+            f"  Use --timeout to wait longer on a slow network."
+        )
+
+    client.close()
+    sys.exit(1)
+
+def run_cli_commands_for_web(vm_ip, timeout=CONNECT_TIMEOUT):
     # hop 1: ingress VM
     ingress = paramiko.SSHClient()
     ingress.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -161,28 +228,17 @@ def run_cli_commands_for_web(vm_ip):
             "20.198.17.8",
             username="kaneaiingressvm",
             password=os.environ["INGRESS_PASS"],
+            **ssh_timeouts(timeout),
         )
     except paramiko.AuthenticationException:
         print("✗ Ingress VM (20.198.17.8) rejected the login — check INGRESS_PASS in .env.")
         sys.exit(1)
-    except (paramiko.SSHException, OSError) as e:
+    except (paramiko.SSHException, socket.timeout, OSError) as e:
         print(f"✗ Cannot reach the ingress VM (20.198.17.8): {e}")
         sys.exit(1)
 
     # tunnel from ingress → target VM's SSH port
-    try:
-        channel = ingress.get_transport().open_channel(
-            "direct-tcpip",
-            (vm_ip, 22),        # target
-            ("127.0.0.1", 0),   # source
-        )
-    except paramiko.ChannelException:
-        print(
-            f"✗ Cannot reach {vm_ip}:22 through the ingress VM.\n"
-            f"  The target VM may be down, recycled, or in a different network."
-        )
-        ingress.close()
-        sys.exit(1)
+    channel = open_tunnel_channel(ingress, "ingress VM", vm_ip, timeout=max(timeout, CHANNEL_TIMEOUT))
 
     # hop 2: target VM as azureuser (bifurcation = true)
     target = paramiko.SSHClient()
@@ -193,13 +249,16 @@ def run_cli_commands_for_web(vm_ip):
             username="azureuser",
             password=os.environ["AZURE_PASS"],
             sock=channel,
+            **ssh_timeouts(timeout),
         )
     except paramiko.AuthenticationException:
         print(f"✗ Target VM ({vm_ip}) rejected the azureuser login — check AZURE_PASS in .env.")
+        channel.close()
         ingress.close()
         sys.exit(1)
-    except (paramiko.SSHException, OSError) as e:
+    except (paramiko.SSHException, socket.timeout, OSError) as e:
         print(f"✗ Failed to establish SSH to target VM ({vm_ip}): {e}")
+        channel.close()
         ingress.close()
         sys.exit(1)
 
@@ -217,33 +276,49 @@ def run_cli_commands_for_web(vm_ip):
         target.close()
         ingress.close()
 
-def run_cli_commands_for_device(host_ip, udid, _os):
+def run_cli_commands_for_device(host_ip, udid, _os, timeout=CONNECT_TIMEOUT):
     # 1. connect to the bastion
     bastion = paramiko.SSHClient()
     bastion.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    bastion.connect(
-        "bastion-stage.lambdatest.com",
-        username=os.environ["SSH_USER"],
-        password=os.environ["SSH_PASS"],
-    )
+    try:
+        bastion.connect(
+            "bastion-stage.lambdatest.com",
+            username=os.environ["SSH_USER"],
+            password=os.environ["SSH_PASS"],
+            **ssh_timeouts(timeout),
+        )
+    except paramiko.AuthenticationException:
+        print("✗ bastion-stage.lambdatest.com rejected the login — check SSH_USER/SSH_PASS in .env.")
+        sys.exit(1)
+    except (paramiko.SSHException, socket.timeout, OSError) as e:
+        print(f"✗ Cannot reach bastion-stage.lambdatest.com: {e}")
+        sys.exit(1)
 
     # 2. open a tunnel from the bastion to the target host's SSH port
-    channel = bastion.get_transport().open_channel(
-        "direct-tcpip",
-        (host_ip, 22),      # target
-        ("127.0.0.1", 0),   # source
-    )
+    channel = open_tunnel_channel(bastion, "bastion", host_ip, timeout=max(timeout, CHANNEL_TIMEOUT))
 
     # 3. connect to the target as ltadmin through that tunnel
     #    AutoAddPolicy = auto-accept the fingerprint ("yes")
     target = paramiko.SSHClient()
     target.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    target.connect(
-        host_ip,
-        username="ltadmin",
-        password=os.environ["LTADMIN_PASS"],
-        sock=channel,
-    )
+    try:
+        target.connect(
+            host_ip,
+            username="ltadmin",
+            password=os.environ["LTADMIN_PASS"],
+            sock=channel,
+            **ssh_timeouts(timeout),
+        )
+    except paramiko.AuthenticationException:
+        print(f"✗ Host ({host_ip}) rejected the ltadmin login — check LTADMIN_PASS in .env.")
+        channel.close()
+        bastion.close()
+        sys.exit(1)
+    except (paramiko.SSHException, socket.timeout, OSError) as e:
+        print(f"✗ Failed to establish SSH to host ({host_ip}): {e}")
+        channel.close()
+        bastion.close()
+        sys.exit(1)
 
     # 4. cd + tail -f on the target, streamed line by line
     cmd = ""
@@ -253,8 +328,10 @@ def run_cli_commands_for_device(host_ip, udid, _os):
         cmd = f"cd Documents/kaneai/app_agent_{udid} && tail -f app.log"
     else:
         print(f"Unknown OS: {_os}")
+        target.close()
+        bastion.close()
         return
-    
+
     print(f"\n$ {cmd}\n(streaming — press Ctrl+C to stop)\n")
     stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
 
@@ -283,24 +360,46 @@ def main():
             "query is run. Defaults to a sample query."
         ),
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=CONNECT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "How long to wait for each SSH connection step before giving up "
+            f"(default: {CONNECT_TIMEOUT}). Raise this on a slow network."
+        ),
+    )
     args = parser.parse_args()
     arg = args.query
-    if("kaneaivm" in arg):
-        #do web
-        run_cli_commands_for_web(get_vm_ip(arg))
 
-    elif("device" in arg):
-        if arg.startswith("http://") or arg.startswith("https://"):
-            query = build_session_query(arg)
+    try:
+        if("kaneaivm" in arg):
+            #do web
+            try:
+                vm_ip = get_vm_ip(arg)
+            except ValueError as e:
+                print(f"✗ {e}")
+                sys.exit(1)
+            run_cli_commands_for_web(vm_ip, timeout=args.timeout)
+
+        elif("device" in arg):
+            if arg.startswith("http://") or arg.startswith("https://"):
+                query = build_session_query(arg)
+            else:
+                query = arg
+
+            udid = run_query_get_udid(query)
+            host_ip, _os = run_query_get_hostIP(udid)
+            run_cli_commands_for_device(host_ip, udid, _os, timeout=args.timeout)
         else:
-            query = arg
-
-        udid = run_query_get_udid(query)
-        host_ip, _os = run_query_get_hostIP(udid)
-        run_cli_commands_for_device(host_ip, udid, _os)
-    else:
-        print("Invalid argument. Please provide a valid SQL query or a kaneai URL.")
-        sys.exit(1)
+            print("Invalid argument. Please provide a valid SQL query or a kaneai URL.")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        # Ctrl+C while connecting/opening the tunnel, i.e. before the streaming
+        # loop takes over — exit quietly instead of dumping a paramiko traceback.
+        print("\nCancelled.")
+        sys.exit(130)
 
 if __name__ == "__main__":
     main()
