@@ -158,7 +158,7 @@ def run_cli_commands_for_web(vm_ip):
     ingress.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         ingress.connect(
-            "20.198.17.8",
+            "172.172.160.155",
             username="kaneaiingressvm",
             password=os.environ["INGRESS_PASS"],
         )
