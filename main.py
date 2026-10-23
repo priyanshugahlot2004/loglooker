@@ -1,11 +1,50 @@
 from sshtunnel import SSHTunnelForwarder
 from dotenv import load_dotenv
 from urllib.parse import urlparse, parse_qs, unquote
+from datetime import datetime
+from pathlib import Path
 import pymysql
 import argparse
 import sys
 import os
 import paramiko
+
+
+LOG_DIR = Path("logs")
+
+
+def stream_and_save(stdout, name, log_file=None):
+    """Print a remote stream live while writing every line to a .log file.
+
+    Lines are flushed as they arrive, so whatever was received is already on
+    disk even if the process is killed rather than interrupted with Ctrl+C.
+    """
+    if log_file:
+        path = Path(log_file)
+        if path.parent != Path("."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = LOG_DIR / f"{name}-{ts}.log"
+
+    print(f"(saving to {path})\n")
+
+    lines = 0
+    try:
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            try:
+                for line in iter(stdout.readline, ""):
+                    print(line, end="")
+                    f.write(line)
+                    f.flush()
+                    lines += 1
+            except KeyboardInterrupt:
+                print("\nStopped.")
+    finally:
+        print(f"\nSaved {lines} lines to {path.resolve()}")
+
+    return path
 
 
 def parse_url(url):
@@ -152,7 +191,7 @@ def run_query_get_hostIP(udid):
         finally:
             conn.close()
 
-def run_cli_commands_for_web(vm_ip):
+def run_cli_commands_for_web(vm_ip, log_file=None):
     # hop 1: ingress VM
     ingress = paramiko.SSHClient()
     ingress.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -204,20 +243,17 @@ def run_cli_commands_for_web(vm_ip):
         sys.exit(1)
 
     # cd + tail -f, streamed line by line
-    cmd = "cd /usr/src/app/scripts/logger && tail -n 1000 -f app.log"
+    cmd = "cd /usr/src/app/scripts/logger && tail -f app.log"
     print(f"\n$ {cmd}\n(streaming — press Ctrl+C to stop)\n")
     stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
 
     try:
-        for line in iter(stdout.readline, ""):
-            print(line, end="")
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        stream_and_save(stdout, f"web-{vm_ip}", log_file)
     finally:
         target.close()
         ingress.close()
 
-def run_cli_commands_for_device(host_ip, udid, _os):
+def run_cli_commands_for_device(host_ip, udid, _os, log_file=None):
     # 1. connect to the bastion
     bastion = paramiko.SSHClient()
     bastion.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -259,10 +295,7 @@ def run_cli_commands_for_device(host_ip, udid, _os):
     stdin, stdout, stderr = target.exec_command(cmd, get_pty=True)
 
     try:
-        for line in iter(stdout.readline, ""):
-            print(line, end="")
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        stream_and_save(stdout, f"{_os}-{udid}", log_file)
     finally:
         target.close()
         bastion.close()
@@ -283,11 +316,19 @@ def main():
             "query is run. Defaults to a sample query."
         ),
     )
+    parser.add_argument(
+        "-o", "--log-file",
+        default=None,
+        help=(
+            "Path to write the streamed logs to. Defaults to "
+            "logs/<name>-<timestamp>.log"
+        ),
+    )
     args = parser.parse_args()
     arg = args.query
     if("kaneaivm" in arg):
         #do web
-        run_cli_commands_for_web(get_vm_ip(arg))
+        run_cli_commands_for_web(get_vm_ip(arg), args.log_file)
 
     elif("device" in arg):
         if arg.startswith("http://") or arg.startswith("https://"):
@@ -297,7 +338,7 @@ def main():
 
         udid = run_query_get_udid(query)
         host_ip, _os = run_query_get_hostIP(udid)
-        run_cli_commands_for_device(host_ip, udid, _os)
+        run_cli_commands_for_device(host_ip, udid, _os, args.log_file)
     else:
         print("Invalid argument. Please provide a valid SQL query or a kaneai URL.")
         sys.exit(1)
